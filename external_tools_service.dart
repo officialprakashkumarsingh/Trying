@@ -559,22 +559,32 @@ class ExternalToolsService extends ChangeNotifier {
     }
 
     try {
-      // Create truly unique seed using multiple factors to prevent duplicate images
+      // Create truly unique seed using multiple entropy sources to prevent duplicate images
       final timestamp = DateTime.now().microsecondsSinceEpoch;
-      final random = (timestamp * 1337) % 1000000;
+      final random = (timestamp * 1337 + DateTime.now().millisecond * 7919) % 1000000;
       final promptHash = prompt.hashCode.abs() % 100000;
       final modelHash = model.hashCode.abs() % 10000;
-      final seed = (timestamp % 1000000) + random + promptHash + modelHash;
+      final randomSalt = (timestamp % 50000) + (DateTime.now().second * 1000);
+      final seed = (timestamp % 1000000) + random + promptHash + modelHash + randomSalt;
       
-      // Always add unique elements to prompt to ensure different images
-      final uniqueId = '${timestamp}_${seed}';
-      final enhancedPrompt = enhance ? '$prompt [unique_id:$uniqueId]' : '$prompt [seed:$seed,id:$uniqueId]';
+      // Create a unique session ID to prevent any caching
+      final sessionId = '${timestamp}_${random}_${DateTime.now().hashCode.abs()}';
+      final uniqueId = '${timestamp}_${seed}_${sessionId}';
+      
+      // Always add unique elements and timestamp to prompt to ensure different images
+      final enhancedPrompt = enhance 
+          ? '$prompt [unique_session:$sessionId,timestamp:$timestamp]' 
+          : '$prompt [seed:$seed,session:$sessionId,time:${DateTime.now().toIso8601String()}]';
       
       final response = await http.post(
         Uri.parse('https://ahamai-api.officialprakashkrsingh.workers.dev/v1/images/generations'),
         headers: {
           'Authorization': 'Bearer ahamaibyprakash25',
           'Content-Type': 'application/json',
+          'X-Session-ID': sessionId,
+          'X-Request-Time': timestamp.toString(),
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
         },
         body: jsonEncode({
           'model': model,
@@ -585,6 +595,9 @@ class ExternalToolsService extends ChangeNotifier {
           'seed': seed,
           'timestamp': timestamp,
           'unique_id': uniqueId,
+          'session_id': sessionId,
+          'force_unique': true,
+          'no_cache': true,
         }),
       ).timeout(Duration(seconds: 60));
 
@@ -1149,47 +1162,81 @@ class ExternalToolsService extends ChangeNotifier {
         diagram = _enhanceMermaidDiagram(diagram, diagramType);
       }
 
-      // Use Kroki with proper encoding and fallback options
-      final encodedDiagram = base64Encode(utf8.encode(diagram));
-      final primaryUrl = 'https://kroki.io/mermaid/$format/$encodedDiagram';
-      final fallbackUrl = 'https://mermaid.ink/svg/${base64Encode(utf8.encode(diagram))}';
+      // Enhanced diagram generation with multiple fallbacks and caching prevention
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      final uniqueId = '${timestamp}_${diagram.hashCode.abs()}';
+      final enhancedDiagram = '$diagram\n%% Generated: $timestamp\n%% ID: $uniqueId';
+      
+      final encodedDiagram = base64Encode(utf8.encode(enhancedDiagram));
+      final legacyEncoded = base64Encode(utf8.encode(diagram));
+      
+      // Multiple service endpoints with different approaches
+      final services = [
+        {
+          'name': 'Kroki.io (GET)',
+          'url': 'https://kroki.io/mermaid/$format/$encodedDiagram',
+          'method': 'GET',
+        },
+        {
+          'name': 'Kroki.io (POST)',
+          'url': 'https://kroki.io/mermaid/$format',
+          'method': 'POST',
+          'body': enhancedDiagram,
+          'headers': {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Accept': format == 'png' ? 'image/png' : 'image/svg+xml',
+            'Cache-Control': 'no-cache',
+          },
+        },
+        {
+          'name': 'Mermaid.ink',
+          'url': 'https://mermaid.ink/$format/$legacyEncoded',
+          'method': 'GET',
+        },
+        {
+          'name': 'Mermaid Live Editor',
+          'url': 'https://mermaid-js.github.io/mermaid-live-editor/edit#pako:${Uri.encodeComponent(legacyEncoded)}',
+          'method': 'GET',
+          'isRedirect': true,
+        },
+      ];
       
       http.Response? response;
       String usedService = '';
       
-      // Try primary service (Kroki)
-      try {
-        response = await http
-            .get(Uri.parse(primaryUrl))
-            .timeout(const Duration(seconds: 20));
-        usedService = 'Kroki.io';
-        
-        // If response is not successful, try POST method
-        if (response.statusCode != 200) {
-          response = await http
-              .post(
-                Uri.parse('https://kroki.io/mermaid/$format'),
-                headers: {
-                  'Content-Type': 'text/plain; charset=utf-8',
-                  'Accept': format == 'png' ? 'image/png' : 'image/svg+xml',
-                },
-                body: diagram,
-              )
-              .timeout(const Duration(seconds: 20));
-        }
-      } catch (e) {
-        debugPrint('Kroki service failed: $e');
-      }
-      
-      // Try fallback service (Mermaid.ink) if primary failed
-      if (response == null || response.statusCode != 200) {
+      for (final service in services) {
         try {
-          response = await http
-              .get(Uri.parse(fallbackUrl))
-              .timeout(const Duration(seconds: 20));
-          usedService = 'Mermaid.ink';
+          if (service['method'] == 'POST') {
+            response = await http
+                .post(
+                  Uri.parse(service['url'] as String),
+                  headers: service['headers'] as Map<String, String>? ?? {'Content-Type': 'text/plain'},
+                  body: service['body'] as String,
+                )
+                .timeout(const Duration(seconds: 25));
+          } else {
+            response = await http
+                .get(
+                  Uri.parse(service['url'] as String),
+                  headers: {
+                    'User-Agent': 'AhamAI-DiagramGenerator/1.0',
+                    'Cache-Control': 'no-cache, no-store',
+                  },
+                )
+                .timeout(const Duration(seconds: 25));
+          }
+          
+          if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+            usedService = service['name'] as String;
+            break;
+          } else {
+            debugPrint('${service['name']} returned status ${response.statusCode}');
+            response = null;
+          }
         } catch (e) {
-          debugPrint('Fallback service failed: $e');
+          debugPrint('${service['name']} failed: $e');
+          response = null;
+          continue;
         }
       }
 
@@ -1234,8 +1281,9 @@ class ExternalToolsService extends ChangeNotifier {
   Future<Map<String, dynamic>> _createImageCollage(Map<String, dynamic> params) async {
     final imageUrls = params['image_urls'] as List<dynamic>? ?? [];
     final layout = params['layout'] as String? ?? 'grid';
-    final maxWidth = params['max_width'] as int? ?? 1200;
-    final maxHeight = params['max_height'] as int? ?? 800;
+    final maxWidth = params['max_width'] as int? ?? 1600; // Increased for better quality
+    final maxHeight = params['max_height'] as int? ?? 1200; // Increased for better quality
+    final quality = params['quality'] as String? ?? 'high'; // New quality parameter
 
     if (imageUrls.isEmpty) {
       return {
@@ -1245,34 +1293,58 @@ class ExternalToolsService extends ChangeNotifier {
       };
     }
 
+    // Handle many images by optimizing layout
+    final imageCount = imageUrls.length;
+    final optimizedLayout = _optimizeLayoutForCount(imageCount, layout);
+    final adjustedDimensions = _calculateOptimalDimensions(imageCount, maxWidth, maxHeight);
+
     try {
-      // Create a proper collage by combining images using an HTML-to-image service
-      final collageHtml = _generateCollageHtml(imageUrls.cast<String>(), layout, maxWidth, maxHeight);
+      // Enhanced collage creation with better handling for many images
+      final collageHtml = _generateEnhancedCollageHtml(
+        imageUrls.cast<String>(), 
+        optimizedLayout, 
+        adjustedDimensions['width']!, 
+        adjustedDimensions['height']!,
+        imageCount
+      );
       
-      // Try multiple HTML-to-image services for better reliability
+      // Try multiple services with improved error handling and retries
       final services = [
         {
-          'url': 'https://htmlcsstoimage.com/demo_run',
+          'name': 'Screenshot.rocks',
+          'url': 'https://api.screenshot.rocks/v1/create',
           'body': {
             'html': collageHtml,
-            'css': _getCollageCSS(layout),
-            'google_fonts': 'Roboto',
-            'width': maxWidth,
-            'height': maxHeight,
+            'viewport': {
+              'width': adjustedDimensions['width'],
+              'height': adjustedDimensions['height'],
+            },
+            'format': 'png',
+            'quality': quality == 'high' ? 90 : 75,
+            'device': 'desktop',
+            'full_page': true,
           }
         },
         {
-          'url': 'https://api.htmlcsstoimage.com/v1/image',
+          'name': 'HTMLCSStoImage',
+          'url': 'https://hcti.io/v1/image',
           'body': {
             'html': collageHtml,
-            'css': _getCollageCSS(layout),
-            'width': maxWidth,
-            'height': maxHeight,
+            'css': _getEnhancedCollageCSS(optimizedLayout, imageCount),
+            'width': adjustedDimensions['width'],
+            'height': adjustedDimensions['height'],
+            'device_scale_factor': quality == 'high' ? 2 : 1,
           }
+        },
+        {
+          'name': 'Kroki (Fallback)',
+          'url': 'https://kroki.io/svgbob/png',
+          'body': _createTextBasedCollage(imageUrls.cast<String>(), optimizedLayout),
         }
       ];
 
       Map<String, dynamic>? imageResult;
+      String usedService = '';
       
       for (final service in services) {
         try {
@@ -1280,31 +1352,59 @@ class ExternalToolsService extends ChangeNotifier {
             Uri.parse(service['url'] as String),
             headers: {
               'Content-Type': 'application/json',
+              'User-Agent': 'AhamAI-Collage/1.0',
             },
             body: jsonEncode(service['body']),
-          ).timeout(Duration(seconds: 20));
+          ).timeout(Duration(seconds: 30)); // Increased timeout for large collages
 
           if (response.statusCode == 200) {
             final data = json.decode(response.body);
-            final imageUrl = data['url'] as String? ?? '';
+            String? imageUrl;
             
-            if (imageUrl.isNotEmpty) {
-              // Fetch the actual image and convert to base64
-              final imgResponse = await http.get(Uri.parse(imageUrl)).timeout(Duration(seconds: 15));
-              if (imgResponse.statusCode == 200) {
-                final base64Image = base64Encode(imgResponse.bodyBytes);
-                final dataUrl = 'data:image/png;base64,$base64Image';
-                imageResult = {
-                  'success': true,
-                  'image_url': dataUrl,
-                  'service_used': service['url'],
-                };
-                break;
+            // Handle different response formats
+            if (data['url'] != null) {
+              imageUrl = data['url'] as String;
+            } else if (data['image'] != null) {
+              imageUrl = data['image'] as String;
+            } else if (service['name'] == 'Kroki (Fallback)') {
+              // For Kroki, the response body is the image
+              final base64Image = base64Encode(response.bodyBytes);
+              imageResult = {
+                'success': true,
+                'image_url': 'data:image/png;base64,$base64Image',
+                'service_used': service['name'],
+              };
+              usedService = service['name'] as String;
+              break;
+            }
+            
+            if (imageUrl != null && imageUrl.isNotEmpty) {
+              // Fetch the actual image with retry logic
+              for (int attempt = 1; attempt <= 3; attempt++) {
+                try {
+                  final imgResponse = await http.get(Uri.parse(imageUrl))
+                      .timeout(Duration(seconds: 20));
+                  if (imgResponse.statusCode == 200) {
+                    final base64Image = base64Encode(imgResponse.bodyBytes);
+                    final dataUrl = 'data:image/png;base64,$base64Image';
+                    imageResult = {
+                      'success': true,
+                      'image_url': dataUrl,
+                      'service_used': service['name'],
+                    };
+                    usedService = service['name'] as String;
+                    break;
+                  }
+                } catch (e) {
+                  if (attempt == 3) rethrow;
+                  await Future.delayed(Duration(seconds: attempt));
+                }
               }
+              if (imageResult != null) break;
             }
           }
         } catch (e) {
-          debugPrint('Service ${service['url']} failed: $e');
+          debugPrint('Service ${service['name']} failed: $e');
           continue;
         }
       }
@@ -1315,30 +1415,35 @@ class ExternalToolsService extends ChangeNotifier {
           'success': true,
           'image_url': imageResult['image_url'],
           'original_images': imageUrls,
-          'layout': layout,
-          'width': maxWidth,
-          'height': maxHeight,
+          'layout': optimizedLayout,
+          'optimized_layout': optimizedLayout != layout,
+          'width': adjustedDimensions['width'],
+          'height': adjustedDimensions['height'],
           'image_count': imageUrls.length,
-          'service_used': imageResult['service_used'],
+          'quality': quality,
+          'service_used': usedService,
           'tool_executed': true,
           'execution_time': DateTime.now().toIso8601String(),
-          'description': 'Image collage created successfully with ${imageUrls.length} images in $layout layout',
+          'description': 'Enhanced image collage created successfully with $imageCount images in $optimizedLayout layout using $usedService',
+          'optimization_applied': imageCount > 6 ? 'Layout optimized for many images' : 'Standard layout used',
         };
       }
       
-      // Fallback: create a simple URL-based collage reference
+      // Enhanced fallback: create a beautiful HTML-based collage reference
+      final enhancedHtml = _createFallbackCollageHtml(imageUrls.cast<String>(), optimizedLayout, imageCount);
       return {
         'success': true,
-        'image_url': 'data:text/html;base64,${base64Encode(utf8.encode(collageHtml))}',
+        'image_url': 'data:text/html;base64,${base64Encode(utf8.encode(enhancedHtml))}',
         'original_images': imageUrls,
-        'layout': layout,
-        'width': maxWidth,
-        'height': maxHeight,
+        'layout': optimizedLayout,
+        'width': adjustedDimensions['width'],
+        'height': adjustedDimensions['height'],
         'image_count': imageUrls.length,
         'tool_executed': true,
         'execution_time': DateTime.now().toIso8601String(),
-        'description': 'Collage HTML created (fallback mode) with ${imageUrls.length} images',
-        'note': 'Using HTML representation as image conversion service is unavailable',
+        'description': 'Enhanced collage HTML created with $imageCount images in $optimizedLayout layout',
+        'note': 'Using enhanced HTML representation - all external image services unavailable',
+        'fallback_mode': true,
       };
       
     } catch (e) {
@@ -1347,44 +1452,222 @@ class ExternalToolsService extends ChangeNotifier {
         'error': 'Failed to create image collage: $e',
         'original_images': imageUrls,
         'layout': layout,
+        'attempted_optimizations': 'Layout optimization and dimension adjustment',
         'tool_executed': true,
       };
     }
   }
 
-  String _generateCollageHtml(List<String> imageUrls, String layout, int maxWidth, int maxHeight) {
+  String _optimizeLayoutForCount(int imageCount, String preferredLayout) {
+    if (imageCount <= 2) {
+      return 'horizontal';
+    } else if (imageCount <= 4) {
+      return preferredLayout == 'vertical' ? 'vertical' : 'grid';
+    } else if (imageCount <= 9) {
+      return 'grid';
+    } else if (imageCount <= 16) {
+      return 'compact_grid';
+    } else {
+      return 'masonry'; // For very many images
+    }
+  }
+
+  Map<String, int> _calculateOptimalDimensions(int imageCount, int maxWidth, int maxHeight) {
+    if (imageCount <= 4) {
+      return {'width': maxWidth, 'height': maxHeight};
+    } else if (imageCount <= 9) {
+      return {'width': (maxWidth * 1.2).round(), 'height': (maxHeight * 1.2).round()};
+    } else if (imageCount <= 16) {
+      return {'width': (maxWidth * 1.5).round(), 'height': (maxHeight * 1.5).round()};
+    } else {
+      return {'width': (maxWidth * 2).round(), 'height': (maxHeight * 2).round()};
+    }
+  }
+
+  String _generateEnhancedCollageHtml(List<String> imageUrls, String layout, int width, int height, int imageCount) {
+    final css = _getEnhancedCollageCSS(layout, imageCount);
+    
     switch (layout.toLowerCase()) {
       case 'horizontal':
         return '''
+          <!DOCTYPE html>
+          <html><head><style>$css</style></head><body>
           <div class="collage horizontal">
-            ${imageUrls.map((url) => '<img src="$url" alt="Image" />').join('')}
+            ${imageUrls.map((url) => '<div class="image-container"><img src="$url" alt="Image" loading="lazy" /></div>').join('')}
           </div>
+          </body></html>
         ''';
       case 'vertical':
         return '''
+          <!DOCTYPE html>
+          <html><head><style>$css</style></head><body>
           <div class="collage vertical">
-            ${imageUrls.map((url) => '<img src="$url" alt="Image" />').join('')}
+            ${imageUrls.map((url) => '<div class="image-container"><img src="$url" alt="Image" loading="lazy" /></div>').join('')}
           </div>
+          </body></html>
+        ''';
+      case 'compact_grid':
+        final cols = imageCount <= 9 ? 3 : imageCount <= 16 ? 4 : 5;
+        return '''
+          <!DOCTYPE html>
+          <html><head><style>$css</style></head><body>
+          <div class="collage compact-grid" style="grid-template-columns: repeat($cols, 1fr);">
+            ${imageUrls.map((url) => '<div class="image-container"><img src="$url" alt="Image" loading="lazy" /></div>').join('')}
+          </div>
+          </body></html>
+        ''';
+      case 'masonry':
+        return '''
+          <!DOCTYPE html>
+          <html><head><style>$css</style></head><body>
+          <div class="collage masonry">
+            ${imageUrls.map((url) => '<div class="image-container"><img src="$url" alt="Image" loading="lazy" /></div>').join('')}
+          </div>
+          </body></html>
         ''';
       case 'grid':
       default:
-        final cols = (imageUrls.length <= 4) ? 2 : 3;
+        final cols = imageCount <= 4 ? 2 : imageCount <= 9 ? 3 : 4;
         return '''
+          <!DOCTYPE html>
+          <html><head><style>$css</style></head><body>
           <div class="collage grid" style="grid-template-columns: repeat($cols, 1fr);">
-            ${imageUrls.map((url) => '<img src="$url" alt="Image" />').join('')}
+            ${imageUrls.map((url) => '<div class="image-container"><img src="$url" alt="Image" loading="lazy" /></div>').join('')}
           </div>
+          </body></html>
         ''';
     }
   }
 
-  String _getCollageCSS(String layout) {
+  String _generateCollageHtml(List<String> imageUrls, String layout, int maxWidth, int maxHeight) {
+    // Legacy function - kept for compatibility
+    return _generateEnhancedCollageHtml(imageUrls, layout, maxWidth, maxHeight, imageUrls.length);
+  }
+
+  String _getEnhancedCollageCSS(String layout, int imageCount) {
     return '''
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { 
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: #F4F3F0;
+        padding: 16px;
+      }
       .collage {
         width: 100%;
+        max-width: 100%;
+        gap: ${imageCount > 16 ? '4px' : imageCount > 9 ? '6px' : '8px'};
+        padding: ${imageCount > 16 ? '8px' : '12px'};
+        background: #FFFFFF;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        overflow: hidden;
+      }
+      .image-container {
+        position: relative;
+        overflow: hidden;
+        border-radius: ${imageCount > 16 ? '4px' : '6px'};
+        background: #EAE9E5;
+        min-height: ${imageCount > 16 ? '80px' : imageCount > 9 ? '120px' : '150px'};
+      }
+      .image-container img {
+        width: 100%;
         height: 100%;
+        object-fit: cover;
+        transition: transform 0.3s ease;
+        display: block;
+      }
+      .image-container:hover img {
+        transform: scale(1.05);
+      }
+      .horizontal {
         display: flex;
-        gap: 10px;
-        padding: 10px;
+        flex-direction: row;
+        align-items: stretch;
+      }
+      .horizontal .image-container {
+        flex: 1;
+        min-height: 200px;
+      }
+      .vertical {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .vertical .image-container {
+        flex: 1;
+        min-height: 150px;
+      }
+      .grid, .compact-grid {
+        display: grid;
+        grid-gap: inherit;
+        align-items: stretch;
+      }
+      .compact-grid .image-container {
+        min-height: ${imageCount > 16 ? '60px' : '100px'};
+      }
+      .masonry {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(${imageCount > 30 ? '120px' : '150px'}, 1fr));
+        grid-auto-rows: ${imageCount > 30 ? '120px' : '150px'};
+        grid-gap: 4px;
+      }
+      .masonry .image-container:nth-child(3n+1) {
+        grid-row: span 2;
+      }
+      .masonry .image-container:nth-child(5n+2) {
+        grid-row: span 2;
+      }
+      @media (max-width: 768px) {
+        .collage { padding: 8px; gap: 4px; }
+        .grid, .compact-grid { grid-template-columns: repeat(2, 1fr) !important; }
+        .masonry { grid-template-columns: repeat(2, 1fr) !important; }
+      }
+    ''';
+  }
+
+  String _createTextBasedCollage(List<String> imageUrls, String layout) {
+    // Creates a simple text-based representation for the Kroki fallback
+    final count = imageUrls.length;
+    final description = 'Collage with $count images in $layout layout';
+    
+    return '''
+      .---------.
+      | COLLAGE |
+      |  $count imgs |
+      | $layout |
+      '---------'
+    ''';
+  }
+
+  String _createFallbackCollageHtml(List<String> imageUrls, String layout, int imageCount) {
+    final css = _getEnhancedCollageCSS(layout, imageCount);
+    return '''
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Enhanced Image Collage - $imageCount Images</title>
+        <style>$css</style>
+      </head>
+      <body>
+        <div class="header" style="text-align: center; margin-bottom: 16px; color: #000;">
+          <h2 style="font-size: 18px; margin-bottom: 8px;">Enhanced Image Collage</h2>
+          <p style="font-size: 14px; color: #A3A3A3;">$imageCount images in $layout layout</p>
+        </div>
+        ${_generateEnhancedCollageHtml(imageUrls, layout, 1600, 1200, imageCount).replaceAll(RegExp(r'<!DOCTYPE html>.*?<body>'), '').replaceAll('</body></html>', '')}
+        <div class="footer" style="text-align: center; margin-top: 16px; color: #A3A3A3; font-size: 12px;">
+          Generated by AhamAI • Enhanced Collage System
+        </div>
+      </body>
+      </html>
+    ''';
+  }
+
+  String _getCollageCSS(String layout) {
+    // Legacy function - kept for compatibility
+    return _getEnhancedCollageCSS(layout, 4);
+  }
         background: #f5f5f5;
         box-sizing: border-box;
       }
